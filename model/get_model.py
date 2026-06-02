@@ -6,8 +6,6 @@ import torch.nn.functional as F
 
 from util.generator import pixel_shuffle_down_sampling, pixel_shuffle_up_sampling
 
-from .APBSN import APBSN
-from .CSCBSN import CSCBSN
 from .MMBSN import MMBSN
 
 class BSN(nn.Module):
@@ -18,7 +16,8 @@ class BSN(nn.Module):
         return cls()
 
     def __init__(self, type='MMBSN', pd_a=5, pd_b=2, pd_pad=2, R3=True, R3_T=8, R3_p=0.16,
-                 in_ch=3, bsn_base_ch=128, bsn_num_module=9, DCL1_num=2, DCL2_num=7, mask_type='o_fsz'):
+                 in_ch=3, bsn_base_ch=128, bsn_num_module=9, DCL1_num=2, DCL2_num=7, mask_type='o_fsz',
+                 use_lca=True, lca_k=2, lca_n_color=2, lca_ca_reduction=16):
         '''
         Args:
             type           : BSN model type
@@ -33,6 +32,10 @@ class BSN(nn.Module):
             bsn_base_ch    : number of bsn base channel
             bsn_num_module : number of module
             mask_type      : types of mask,eg:'o_fsz', 'o_r_c'
+            use_lca        : whether to use LCA attention module at the front of MMBSN
+            lca_k          : number of local perception blocks in LCA
+            lca_n_color    : number of color refinement blocks in LCA
+            lca_ca_reduction: channel attention reduction ratio in LCA
         '''
         super().__init__()
 
@@ -45,12 +48,10 @@ class BSN(nn.Module):
         self.R3_p = R3_p
 
         # define network
-        if type == 'APBSN':
-            self.bsn = APBSN(in_ch, in_ch, bsn_base_ch, bsn_num_module, mask_type)
-        elif type == 'CSCBSN':
-            self.bsn = CSCBSN(in_ch, in_ch, bsn_base_ch, bsn_num_module, mask_type)
-        elif type == 'MMBSN':
-            self.bsn = MMBSN(in_ch, in_ch, bsn_base_ch, DCL1_num, DCL2_num, mask_type)
+        if type == 'MMBSN':
+            self.bsn = MMBSN(in_ch, in_ch, bsn_base_ch, DCL1_num, DCL2_num, mask_type,
+                             use_lca=use_lca, lca_k=lca_k, lca_n_color=lca_n_color,
+                             lca_ca_reduction=lca_ca_reduction)
         else:
             raise NotImplementedError('bsn type %s is not implemented' % type)
 

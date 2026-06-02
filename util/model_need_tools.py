@@ -9,7 +9,7 @@ from model.get_model import BSN
 from util.generator import rot_hflip_img,ssim, psnr
 
 @torch.no_grad()
-def test_dataloader_process(denoiser, dataloader, file_manager, cfg, add_con=0., floor=False, img_save=True, img_save_path=None, info=True, logger=None, status=None):
+def test_dataloader_process(denoiser, dataloader, file_manager, cfg, add_con=0., floor=False, img_save=True, img_save_path=None, info=True, logger=None, status=None, norm_factor=1.0):
     '''
     do test or evaluation process for each dataloader
     include following steps:
@@ -23,6 +23,8 @@ def test_dataloader_process(denoiser, dataloader, file_manager, cfg, add_con=0.,
         img_save : whether to save denoised and clean images.
         img_save_path (optional) : path to save denoised images.
         info (optional) : whether to print info.
+        norm_factor : denormalization factor (e.g. 65535.0 for uint16, 1.0 for no change).
+                      Per-image norm_factor from dataset _load_data takes priority.
     Returns:
         psnr : total PSNR score of dataloaer results or None (if clean image is not available)
         ssim : total SSIM score of dataloder results or None (if clean image is not available)
@@ -44,25 +46,34 @@ def test_dataloader_process(denoiser, dataloader, file_manager, cfg, add_con=0.,
             for key in data:
                 data[key] = data[key].cuda()
 
+        # per-image normalization factor (from dataset _load_data), force to Python float
+        img_norm_factor = float(data.get('norm_factor', norm_factor))
+
         # forward
         input_data = [data[arg] for arg in cfg['model_input']]
-        denoised_image = denoiser(*input_data)
-        # print(denoised_image.shape)
+        denoised_image = denoiser(*input_data)  # in [0, 1] (normalized)
 
-        # add constant and floor (if floor is on)
+        # denormalize for post-processing (add_con/floor are in original pixel space)
+        if img_norm_factor != 1.0:
+            denoised_image = denoised_image * img_norm_factor
+
+        # add constant and floor in original pixel range
         denoised_image += add_con
         if floor: denoised_image = torch.floor(denoised_image)
 
-        # evaluation
+        # evaluation (on denormalized range)
         if 'clean' in data:
-            psnr_value = psnr(denoised_image, data['clean'])
-            ssim_value = ssim(denoised_image, data['clean'])
+            clean_ref = data['clean']
+            if img_norm_factor != 1.0:
+                clean_ref = clean_ref * img_norm_factor
+            psnr_value = psnr(denoised_image, clean_ref)
+            ssim_value = ssim(denoised_image, clean_ref)
 
             psnr_sum += psnr_value
             ssim_sum += ssim_value
             count += 1
 
-        # image save
+        # image save — re-normalize to [0, 1] so save_img_tensor_denorm multiplies ONCE
         if img_save:
             # to cpu
             if 'clean' in data:
@@ -75,16 +86,31 @@ def test_dataloader_process(denoiser, dataloader, file_manager, cfg, add_con=0.,
                 noisy_img = data['noisy']
             else:
                 noisy_img = None
-            if noisy_img is not None: noisy_img = noisy_img.squeeze(0).cpu()
-            denoi_img = denoised_image.squeeze(0).cpu()
+            if noisy_img is not None:
+                noisy_img = noisy_img.squeeze(0).cpu()
+
+            # Re-normalize denoised so save_img_tensor_denorm multiplies once
+            if img_norm_factor != 1.0:
+                denoi_img = (denoised_image / img_norm_factor).squeeze(0).cpu()
+            else:
+                denoi_img = denoised_image.squeeze(0).cpu()
 
             # write psnr value on file name
             denoi_name = '%04d_DN_%.2f' % (idx, psnr_value) if 'clean' in data else '%04d_DN' % idx
 
-            # imwrite
-            if 'clean' in data:         file_manager.save_img_tensor(img_save_path, '%04d_CL' % idx, clean_img)
-            if noisy_img is not None: file_manager.save_img_tensor(img_save_path, '%04d_N' % idx, noisy_img)
-            file_manager.save_img_tensor(img_save_path, denoi_name, denoi_img)
+            # save via PIL with single denormalization (no double-multiply)
+            if img_norm_factor != 1.0:
+                if 'clean' in data:
+                    file_manager.save_img_tensor_denorm(img_save_path, '%04d_CL' % idx, clean_img, img_norm_factor)
+                if noisy_img is not None:
+                    file_manager.save_img_tensor_denorm(img_save_path, '%04d_N' % idx, noisy_img, img_norm_factor)
+                file_manager.save_img_tensor_denorm(img_save_path, denoi_name, denoi_img, img_norm_factor)
+            else:
+                if 'clean' in data:
+                    file_manager.save_img_tensor(img_save_path, '%04d_CL' % idx, clean_img)
+                if noisy_img is not None:
+                    file_manager.save_img_tensor(img_save_path, '%04d_N' % idx, noisy_img)
+                file_manager.save_img_tensor(img_save_path, denoi_name, denoi_img)
             # procedure log msg
         if info:
             if 'clean' in data:

@@ -4,6 +4,7 @@ import torch.nn as nn
 from .masks import CentralMaskedConv2d, RowMaskedConv2d, ColMaskedConv2d, \
     SzMaskedConv2d, fSzMaskedConv2d, angle45MaskedConv2d, \
     angle135MaskedConv2d, chaMaskedConv2d, fchaMaskedConv2d, huiMaskedConv2d
+from .LCA import LCA
 
 
 class MMBSN(nn.Module):
@@ -11,20 +12,32 @@ class MMBSN(nn.Module):
     Dilated Blind-Spot Network (cutomized light version)
 
     self-implemented version of the network from "Unpaired Learning of Deep Image Denoising (ECCV 2020)"
-    and several modificaions are included. 
-    see our supple for more details. 
+    and several modificaions are included.
+    see our supple for more details.
     '''
-    def __init__(self, in_ch=3, out_ch=3, base_ch=128, DCL1_num=2, DCL2_num=7, mask_type='o_fsz'):
+    def __init__(self, in_ch=3, out_ch=3, base_ch=128, DCL1_num=2, DCL2_num=7, mask_type='o_fsz',
+                 use_lca=True, lca_k=2, lca_n_color=2, lca_ca_reduction=16):
         '''
         Args:
             in_ch      : number of input channel
             out_ch     : number of output channel
             base_ch    : number of base channel
             num_module : number of modules in the network
+            use_lca    : whether to use LCA attention module at the front
+            lca_k      : number of local perception blocks in LCA
+            lca_n_color: number of color refinement blocks in LCA
+            lca_ca_reduction: channel attention reduction ratio in LCA
         '''
         super().__init__()
 
         assert base_ch%2 == 0, "base channel should be divided with 2"
+
+        # LCA attention module at the front
+        if use_lca:
+            self.lca = LCA(in_channels=in_ch, out_channels=in_ch,
+                           k=lca_k, n_color=lca_n_color, ca_reduction=lca_ca_reduction)
+        else:
+            self.lca = nn.Identity()
 
         ly0 = []
         ly0 += [ nn.Conv2d(in_ch, base_ch, kernel_size=1) ]
@@ -89,6 +102,7 @@ class MMBSN(nn.Module):
     def forward(self, x):
         mask_types = self.mask_types
 
+        x = self.lca(x)      # LCA attention pre-processing
         x = self.head(x)
         y1 = []
         y2 = []

@@ -1,3 +1,74 @@
+"""
+MM-BSN CONFOCAL — Training Script
+==================================
+Train MM-BSN on confocal microscopy images for self-supervised denoising.
+
+Data for training is loaded via DataDeal/CONFOCAL.py.
+Edit that file to set your dataset path BEFORE running this script.
+
+
+│  QUICK START                                                     
+                                                                  
+  # 1) Train from scratch (single GPU)                            
+  python train.py -c ./config/CONFOCAL -g 0 \\                   
+      -sd ./output/Confocal                                       
+                                                                  
+  # 2) Resume from checkpoint                                     
+  python train.py -c ./config/CONFOCAL -g 0 -r \\                
+      -p ./output/Confocal/checkpoint/CONFOCAL_MMBSN_050.pth \\  
+      -sd ./output/Confocal                                       
+                                                                  
+  # 3) Multi-GPU training                                         
+  python train.py -c ./config/CONFOCAL -g 0,1,2,3 \\             
+      -sd ./output/Confocal                                       
+
+
+
+  ARGUMENTS                                                       
+                                                                  
+  -c, --config         Config file (without .yaml extension).     
+                       Default: config/CONFOCAL                   
+  -g, --gpu            GPU ID(s). Use 'cpu' for CPU mode.         
+                       Multi-GPU: -g 0,1,2,3                      
+  -r, --resume         Resume training from checkpoint.           
+  -p, --pretrained     Checkpoint path for resuming.              
+  -sd, --ckpt_save_folder  Output directory (checkpoints/logs).   
+                       Default: output/Confocal                   
+  -rd, --data_root_dir Root dataset path (default: ./dataset).    
+                       The actual confocal data path is           
+                       hardcoded in DataDeal/CONFOCAL.py.         
+  -t, --thread         DataLoader workers (default: 4).           
+
+
+
+  BEFORE TRAINING                                                 
+                                                                  
+  1. Edit DataDeal/CONFOCAL.py → _scan() → set dataset_path to   
+     your confocal image folder:                                  
+       dataset_path = '../../../Dataset/T3/your_confocal_folder'  
+                                                                  
+  2. Review config/CONFOCAL.yaml for training hyperparameters:    
+     - batch_size, max_epoch, init_lr, scheduler                  
+     - crop_size (must be divisible by pd_a=4)                    
+     - mask_type (e.g. 'o_a45', 'o_fsz')                          
+     - norm_factor (65535.0 for 16-bit, 255.0 for 8-bit)          
+                                                                  
+  3. Ensure the dataset_path directory exists and contains        
+     .png / .tif / .tiff images.                                  
+
+
+
+  OUTPUT STRUCTURE                                                
+                                                                  
+  output/Confocal/                                                
+  ├── checkpoint/           Model checkpoints                     
+  │   └── CONFOCAL_MMBSN_001.pth, ..._002.pth, ...               
+  ├── img/                  Validation denoising results          
+  │   └── val_001/                                               
+  └── tboard/               TensorBoard event logs                
+
+"""
+
 import os
 import argparse
 import math
@@ -15,29 +86,66 @@ from util.file_manager import FileManager
 from util.logger import Logger
 from util.loss import Loss
 from util.generator import human_format
-from DataDeal.Data_loader import preped_RN_data, SIDD_val, DND
+from DataDeal.CONFOCAL import Confocal
+
+# Registry mapping dataset name strings to classes
+_DATASET_REGISTRY = {
+    'Confocal': Confocal,
+}
+
+def _get_dataset_class(name: str):
+    """Look up a dataset class by name string."""
+    if name not in _DATASET_REGISTRY:
+        raise ValueError(f"Unknown dataset: '{name}'. Available: {list(_DATASET_REGISTRY.keys())}")
+    return _DATASET_REGISTRY[name]
+
+
+def _build_dataloader(dataset_cfg, data_root_dir, batch_size, shuffle, num_workers, drop_last=False, default_name='Confocal'):
+    """Build a DataLoader from dataset config. Supports both new (keyed by dataset name)
+    and old (single dataset dict) formats."""
+    dataset_dict = dataset_cfg.get('dataset', None)
+    if dataset_dict is None or isinstance(dataset_dict, str):
+        # New format: training.dataset = 'Confocal', training.dataset_args = {...}
+        dataset_name = dataset_dict if isinstance(dataset_dict, str) else default_name
+        DatasetClass = _get_dataset_class(dataset_name)
+        args = dict(dataset_cfg.get('dataset_args', {}))
+    elif isinstance(dataset_dict, dict):
+        # Old format: training.dataset = {'dataset': 'preped_RN_data'}, training.dataset_args = {...}
+        dataset_name = list(dataset_dict.keys())[0]
+        DatasetClass = _get_dataset_class(dataset_name)
+        args = dict(dataset_cfg.get('dataset_args', {}))
+    else:
+        raise ValueError(f"Unsupported dataset config format: {type(dataset_dict)} = {dataset_dict}")
+
+    # Build dataset_path: prefer explicit args, fall back to data_root_dir convention
+    dataset_path = args.pop('dataset_path', None)
+    if dataset_path is None:
+        dataset_path = os.path.join(data_root_dir, 'Confocal')
+
+    dataset = DatasetClass(**args, dataset_path=dataset_path)
+    dataloader = {}
+    dataloader['dataset'] = DataLoader(
+        dataset=dataset, batch_size=batch_size, shuffle=shuffle,
+        num_workers=num_workers, pin_memory=False, drop_last=drop_last)
+    return dataloader
 
 
 
 def train():
     module = set_module(cfg)
     # training dataset loader
-    train_args = train_cfg['dataset_args']
-    train_dataset_path = os.path.join(cfg['data_root_dir'], 'prep/SIDD_s512_o128')
-    train_dataset = preped_RN_data(**train_args, dataset_path=train_dataset_path)
-    train_dataloader = {}
-    train_dataloader['dataset'] = DataLoader(dataset=train_dataset, batch_size=train_cfg['batch_size'], shuffle=True, num_workers=cfg['thread'],
-                                       pin_memory=False)
+    train_dataloader = _build_dataloader(
+        train_cfg, cfg['data_root_dir'],
+        batch_size=train_cfg['batch_size'], shuffle=True,
+        num_workers=cfg['thread'], drop_last=True,
+        default_name='Confocal')
 
     # validation dataset loader
-
-    val_args = val_cfg['dataset_args']
-    val_dataset_path = os.path.join(cfg['data_root_dir'], 'SIDD')
-    val_dataset = SIDD_val(**val_args, dataset_path=val_dataset_path)
-    val_dataloader = {}
-    val_dataloader['dataset'] = DataLoader(dataset=val_dataset, batch_size=1, shuffle=False,
-                                           num_workers=cfg['thread'],
-                                           pin_memory=False)
+    val_dataloader = _build_dataloader(
+        val_cfg, cfg['data_root_dir'],
+        batch_size=1, shuffle=False,
+        num_workers=cfg['thread'], drop_last=False,
+        default_name='Confocal')
     # other configuration
     max_epoch = train_cfg['max_epoch']
     epoch = start_epoch = 1
@@ -152,20 +260,20 @@ def train():
                                                               img_save_path=img_save_path,
                                                               img_save=val_cfg['save_image'],
                                                              logger=logger,
-                                                             status=status)
+                                                             status=status,
+                                                             norm_factor=val_cfg.get('norm_factor', 1.0))
 
     logger.highlight(logger.get_finish_msg())
 
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
-    args.add_argument('-c',  '--config',            default='config/SIDD',  type=str)
-    args.add_argument('-g',  '--gpu',               default='0,1,2,3',  type=str)
+    args.add_argument('-c',  '--config',            default='config/CONFOCAL',  type=str)
+    args.add_argument('-g',  '--gpu',               default='0',  type=str)
     args.add_argument('-r',  '--resume',            default=False)
     args.add_argument('-p',  '--pretrained',        default=None,  type=str)
     args.add_argument('-t',  '--thread',            default=4,     type=int)
-    args.add_argument('-se',  '--self_en',          action='store_true')
-    args.add_argument('-sd', '--ckpt_save_folder',  default='output/MMBSN_SIDD_all', type=str)
-    args.add_argument('-rd', '--data_root_dir',     default='/home/uc/proj/zhoufangfang/models/denosing/AP-BSN-master/dataset', type=str)
+    args.add_argument('-sd', '--ckpt_save_folder',  default='output/Confocal', type=str)
+    args.add_argument('-rd', '--data_root_dir',     default='./dataset', type=str)
 
     args = args.parse_args()
 
